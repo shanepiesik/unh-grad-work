@@ -1,0 +1,289 @@
+---
+title: "Airline Itineraries Data Quiz 1"
+author: "Shane Piesik"
+date: "2/12/2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+#### Machine Learning - UNH (Spring)
+#### Oral Quiz 1
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+
+## Read Files & Merge
+```{r, message=FALSE}
+library(data.table)
+## read files and merge in one line (take advantage of similar file names)
+all_quarters<- rbindlist(lapply(append(sprintf("q%d_16_sample.csv", 1:3), "q4_15_sample.csv"), read.csv, sep = " "))
+
+names(all_quarters)
+dim(all_quarters)
+```
+
+## Create New Features 
+
+### Origin and destination state names
+
+
+#### Scrape FIPS codes from US Census Bureau
+```{r}
+library(tidyverse)
+library(stringr)
+library(rvest)
+fips_state_codes <- read_html("https://www.census.gov/geo/reference/ansi_statetables.html")
+
+
+## hate that this isn't automated w/ function
+states<- fips_state_codes %>% 
+  html_nodes("table") %>%
+  html_table() %>% .[[1]] %>%
+  select(1, 2) %>% 
+  rename(area_name = Name, fips_code = `FIPS State Numeric Code`)
+
+outlying_territories<- fips_state_codes %>% 
+  html_nodes("table") %>%
+  html_table() %>% .[[2]] %>%
+  select(1, 2) %>%
+  rename(area_name = `Area Name`, fips_code = `FIPS State Numeric Code`) %>%
+  .[-1,] ## remove first row - it's a long paragraph - don't need it
+
+minor_outlying_territories<- fips_state_codes %>% 
+  html_nodes("table") %>%
+  html_table() %>% .[[3]] %>%
+  select(1, 2) %>%
+  rename(area_name = `Area Name`, fips_code = `FIPS State Numeric Code`)
+
+all_fips_codes<- rbind(states, outlying_territories, minor_outlying_territories)
+
+```
+
+
+#### Create new columns: `origin_state`, `dest_state`
+```{r}
+## create `origin_state`
+names(all_fips_codes)<- c("origin_state", "ORIGIN_STATE_FIPS") ## change names for quick merge and column creation
+all_fips_codes$ORIGIN_STATE_FIPS<- as.numeric(all_fips_codes$ORIGIN_STATE_FIPS)
+all_quarters<- left_join(all_quarters, all_fips_codes, by = "ORIGIN_STATE_FIPS")
+
+## create `dest_state`
+names(all_fips_codes)<- c("dest_state", "DEST_STATE_FIPS") ## change names for quick merge and column creation
+all_fips_codes$DEST_STATE_FIPS<- as.numeric(all_fips_codes$DEST_STATE_FIPS)
+all_quarters<- left_join(all_quarters, all_fips_codes, by = "DEST_STATE_FIPS")
+
+```
+
+
+
+#### Create new columns: `origin_city_state`, `dest_city_state`
+```{r}
+## read city lookup date from US DOT
+city_lookup_table<- read.csv("L_CITY_MARKET_ID.csv")
+
+## create `origin_city_state`
+names(city_lookup_table)<- c("ORIGIN_CITY_MARKET_ID", "origin_city_state")
+all_quarters<- left_join(all_quarters, city_lookup_table, by = "ORIGIN_CITY_MARKET_ID")
+
+## create `dest_city_state`
+names(city_lookup_table)<- c("DEST_CITY_MARKET_ID", "dest_city_state")
+all_quarters<- left_join(all_quarters, city_lookup_table, by = "DEST_CITY_MARKET_ID")
+
+```
+
+#### Create new columns: `cat_ITIN_ID`, `market_fare_quantile` 1:4 for which quantile the price of that flight falls within
+```{r}
+## bin ITIN_ID
+all_quarters$bin_ITIN <- cut(all_quarters$ITIN_ID, breaks = quantile(all_quarters$ITIN_ID),labels=c("1","2","3","4"))
+
+## bin market_fare
+all_quarters$bin_Marketprice<-cut(all_quarters$MARKET_FARE,breaks = quantile(all_quarters$MARKET_FARE),labels = c("Low","Medium","High","Expensive"))
+
+```
+
+
+#### Return flights and One-way
+
+
+```{r}
+x<-length(unique(all_quarters$ITIN_ID))
+all_quarters$dups<-duplicated(all_quarters$ITIN_ID)
+table(all_quarters$dups)
+all_quarters$dups <- gsub("FALSE", "One-way", all_quarters$dups)
+all_quarters$dups <- gsub("TRUE","Round-Trip",all_quarters$dups)
+table(all_quarters$dups)
+
+```
+
+
+#### Create new columns: `tk_carrier_number_of_changes`
+```{r}
+
+all_quarters$TK_CARRIER_GROUP <- as.character(all_quarters$TK_CARRIER_GROUP)
+
+## separate TK_CARRIER_GROUP
+
+## create tk_carrier_*
+all_quarters_test<- separate(all_quarters, TK_CARRIER_GROUP, c("tk_carrier_1", "tk_carrier_2", "tk_carrier_3", "tk_carrier_4", "tk_carrier_5", "tk_carrier_6", "tk_carrier_7"), sep = ":")
+
+
+# Create columns tk_change_count_* --> 1 or 0 if changed from tk_carrier_n to tk_carrier_n + 1
+for(i in 1:6){
+all_quarters_test[, paste0("tk_change_count_", i)] <- ifelse(all_quarters_test[, paste0("tk_carrier_", i)] != all_quarters_test[, paste0("tk_carrier_", i+1)] & (!is.na(all_quarters_test[, paste0("tk_carrier_", i+1)])), 1, 0)
+}
+
+# Sum all tk_change_count to get the total number of changes 
+all_quarters_test<- all_quarters_test %>%
+  mutate(tk_carrier_number_of_changes = rowSums(.[, names(.) %in% sprintf("tk_change_count_%d", 1:6)]))
+
+# remove tk_change_count_* - no longer needed
+all_quarters_test <- all_quarters_test %>%
+  select(-starts_with("tk_change_count_"))
+
+
+## top 20 `tk_carrier_number_of_changes`
+all_quarters_test %>% 
+  select(tk_carrier_number_of_changes) %>%
+  arrange(desc(tk_carrier_number_of_changes)) %>%
+  .[1:50, ]
+
+```
+
+
+
+#### Visualizing the most common origin & destination pairs with `ggmap`
+```{r}
+zips<- read.csv("zip_codes_states.csv")
+
+
+## merge city, state into one columns to merge on
+zips<- unite(zips, city_state, city, state, sep = ", ")
+
+zips<- na.omit(zips)
+
+## create lat & long of origins
+lat_long_origin<- zips %>%
+  select(city_state, latitude, longitude) %>%
+  group_by(city_state) %>%
+  summarise(latitude = mean(latitude), longitude = mean(longitude)) %>%
+  rename(origin_city_state = city_state,
+         origin_lat = latitude, origin_long = longitude)
+
+## create lat & long of destinations
+lat_long_dest<- zips %>%
+  select(city_state, latitude, longitude) %>%
+  group_by(city_state) %>%
+  summarise(latitude = mean(latitude), longitude = mean(longitude)) %>%
+  rename(dest_city_state = city_state,
+         dest_lat = latitude, dest_long = longitude)
+
+
+## get rid of "(Metropolitan Area)"
+all_quarters$origin_city_state<- as.character(all_quarters$origin_city_state)
+all_quarters$origin_city_state<- str_replace(all_quarters$origin_city_state, " \\(.*\\)", "")
+
+all_quarters$dest_city_state<- as.character(all_quarters$dest_city_state)
+all_quarters$dest_city_state<- str_replace(all_quarters$dest_city_state, " \\(.*\\)", "")
+
+## replace New York City with New York
+all_quarters$origin_city_state<- gsub("New York City", "New York", all_quarters$origin_city_state)
+all_quarters$dest_city_state<- gsub("New York City", "New York", all_quarters$dest_city_state)
+all_quarters$origin_city_state<- gsub("St.", "Saint", all_quarters$origin_city_state)
+all_quarters$dest_city_state<- gsub("St.", "Saint", all_quarters$dest_city_state)
+all_quarters$origin_city_state<- gsub("Kona", "Kailua Kona", all_quarters$origin_city_state)
+all_quarters$dest_city_state<- gsub("Kona", "Kailua Kona", all_quarters$dest_city_state)
+all_quarters$origin_city_state<- gsub("-", " ", all_quarters$origin_city_state)
+all_quarters$dest_city_state<- gsub("-", " ", all_quarters$dest_city_state)
+all_quarters$origin_city_state<- gsub("Ft.", "Fort", all_quarters$origin_city_state)
+all_quarters$dest_city_state<- gsub("Ft.", "Fort", all_quarters$dest_city_state)
+
+## remove everything the left of / on dual cities using basename(), meant for getting file name from path
+all_quarters$origin_city_state<- basename(all_quarters$origin_city_state)
+all_quarters$dest_city_state<- basename(all_quarters$dest_city_state)
+
+
+all_quarters<- left_join(all_quarters, lat_long_origin, by = "origin_city_state")
+all_quarters<- left_join(all_quarters, lat_long_dest, by = "dest_city_state")
+
+
+```
+
+
+
+```{r}
+library(ggmap)
+map<-get_map(location='united states', zoom=4, maptype = 'terrain',
+             source='google',color='color')
+
+reasonable_prices<- all_quarters %>%
+  filter(MARKET_FARE <= 600)
+
+ggmap(map) + geom_point(
+        aes(x = origin_long, y = origin_lat, colour = MARKET_FARE), 
+        data = reasonable_prices, alpha = 0.8, na.rm = T) +
+        scale_color_gradient(low="beige", high="blue")
+```
+
+
+
+
+
+
+
+
+```{r}
+ggmap(map) + geom_point(
+        aes(x = dest_long, y = dest_lat, colour = MARKET_FARE), 
+        data = reasonable_prices, alpha = 0.8, na.rm = T) +
+        scale_color_gradient(low="beige", high="blue")
+```
+
+### Top 50 Origin to Destinations Matches 
+```{r}
+library(ggrepel)
+frequent_locations<- all_quarters %>%
+  select(origin_city_state, dest_city_state, origin_lat, origin_long, dest_lat, dest_long)
+
+top_n_pairs <- frequent_locations %>%
+  group_by(origin_city_state, dest_city_state) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+top_n_pairs<- left_join(top_n_pairs, lat_long_origin, by = "origin_city_state")
+top_n_pairs<- left_join(top_n_pairs, lat_long_dest, by = "dest_city_state")
+
+## Top 10 
+top_n_pairs %>% 
+  select(1:3) %>%
+  head(n = 10)
+  
+
+destination_map<- ggmap(map, extent = "device", legend = "topleft") + stat_density2d(
+  aes(x = dest_long, y = dest_lat, fill = ..level..,
+  alpha = ..level..), na.rm = T,
+  size = 2, bins = 4, data = top_n_pairs,
+  geom = "polygon") + guides(fill = FALSE, alpha = FALSE) +
+  ggtitle("Destination Density")
+
+destination_map
+```
+
+```{r}
+## nearly the EXACT SAME AS DESTINATION
+origin_map<- ggmap(map, extent = "device", legend = "topleft") + stat_density2d(
+  aes(x = origin_long, y = origin_lat, fill = ..level..,
+  alpha = ..level..), na.rm = T,
+  size = 2, bins = 4, data = top_n_pairs,
+  geom = "polygon") + guides(fill = FALSE, alpha = FALSE) +
+  ggtitle("Origin Density")
+
+origin_map
+
+```
+
+
+
+
+
